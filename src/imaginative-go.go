@@ -2,17 +2,22 @@ package main
 
 // If you add an external package here, make sure it also added on
 // docker/golang/Dockerfile so next time if you recreate all containers
-// it will be installed
+// it will be installed.
 import (
 	"bytes"
 	"context"
 	"database/sql"
+	"github.com/alecthomas/chroma"
 	"github.com/alecthomas/chroma/formatters/html"
 	"github.com/alecthomas/chroma/lexers"
 	"github.com/alecthomas/chroma/styles"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/julienschmidt/httprouter"
-	"github.com/mongodb/mongo-go-driver/mongo"
+    "github.com/mongodb/mongo-go-driver/mongo"
+	"github.com/mongodb/mongo-go-driver/x/bsonx"
+	//"github.com/mongodb/mongo-go-driver/bson"
+	//"github.com/mongodb/mongo-go-driver/bson/objectid"
+	"gopkg.in/russross/blackfriday.v2"
 	"html/template"
 	"io"
 	"io/ioutil"
@@ -22,10 +27,168 @@ import (
 	"strings"
 )
 
-// Handle / path
-func DefaultHome(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	// Execute template
-	templates.ExecuteTemplate(w, "index_imaginative_go.html", nil)
+type Tag struct {
+    Tag string `bson:"tag"`
+}
+
+type Content struct {
+	ID          string    `bson:"id"`
+	Title bsonx.Val `bson:"title"`
+	Slug string `bson:"slug"`
+	ShortDescription string `bson:"short_description"`
+	ContentFile string `bson:"content_file"`
+	//Tags []string `json:"tags"`
+}
+
+// Prepare struct for syntax highlighter.
+type ChromaRenderer struct {
+	html  *blackfriday.HTMLRenderer
+	theme string
+}
+
+// RenderNode is called with the node being traversed.
+func (r *ChromaRenderer) RenderNode(w io.Writer, node *blackfriday.Node, entering bool) blackfriday.WalkStatus {
+	switch node.Type {
+	// We only care about the pre tag.
+	case blackfriday.CodeBlock:
+		// Set up a lexer.
+		var lexer chroma.Lexer
+
+		// Read the language from the annotation.
+		lang := string(node.CodeBlockData.Info)
+		if lang != "" {
+			lexer = lexers.Get(lang)
+		} else {
+			// Analyze when no language annotation is given.
+			lexer = lexers.Analyse(string(node.Literal))
+		}
+
+		// If no annotation was found and couldn't be analyzed, fallback.
+		if lexer == nil {
+			lexer = lexers.Fallback
+		}
+
+		// Set a syntax highlighting theme
+		style := styles.Get(r.theme)
+		if style == nil {
+			style = styles.Fallback
+		}
+
+		// Apply highlighting with Chroma.
+		iterator, err := lexer.Tokenise(nil, string(node.Literal))
+		if err != nil {
+			panic(err)
+		}
+
+		// An HTML formatter for the tokenized results.
+		formatter := html.New()
+
+		// Write out the highlighted code to the io.Writer.
+		err = formatter.Format(w, style, iterator)
+		if err != nil {
+			panic(err)
+		}
+
+		// Move on to the next node.
+		return blackfriday.GoToNext
+	}
+
+	// Didn't match the CodeBlock type, render it as is.
+	return r.html.RenderNode(w, node, entering)
+}
+
+func (r *ChromaRenderer) RenderHeader(w io.Writer, ast *blackfriday.Node) {}
+func (r *ChromaRenderer) RenderFooter(w io.Writer, ast *blackfriday.Node) {}
+
+func NewChromaRenderer(theme string) *ChromaRenderer {
+	return &ChromaRenderer{
+		html:  blackfriday.NewHTMLRenderer(blackfriday.HTMLRendererParameters{}),
+		theme: theme,
+	}
+}
+
+// Handle / path.
+func HomeHandler(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	// Parse templates.
+	var templates = template.Must(template.New("").ParseFiles("templates/_base.html", "templates/index.html"))
+
+	// Prepare database.
+	client, err := mongo.NewClient("mongodb://root:mongodbpassword@mongodb:27017")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Connect to database.
+	err = client.Connect(context.TODO())
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Select a database.
+	db := client.Database("go_db")
+
+	// Do the query to a collection on database.
+	c, err := db.Collection("sample_content").Find(context.TODO(), nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	defer c.Close(context.TODO())
+
+	rowsData := make([]Content, 0)
+
+    doc := bsonx.Doc{}
+	// Start looping on the query result.
+	for c.Next(context.TODO()) {
+		doc = doc[:0]
+        err := c.Decode(doc)
+
+        if err != nil {
+        log.Fatal(err)
+    }
+
+        title, err := doc.LookupErr("title")
+
+        queryResult := Content{
+            Title: title,
+        }
+        // elem := bson.Doc{}
+
+		// if err = c.Decode(elem); err != nil {
+		// 	log.Fatal(err)
+		// }
+
+		// queryResult := Content{
+		// 	ID:          elem.Lookup("_id").ObjectID().Hex(),
+		// 	Title:   elem.Lookup("title").StringValue(),
+		// 	Slug:  elem.Lookup("slug").StringValue(),
+		// 	ShortDescription:        elem.Lookup("short_description").StringValue(),
+		// 	ContentFile: elem.Lookup("content_file").StringValue(),
+		// 	//Tags: elem.Lookup("tags"),
+		// }
+
+		rowsData = append(rowsData, queryResult)
+	}
+
+	// Execute template.
+	templates.ExecuteTemplate(w, "_base.html", map[string]interface{}{"SampleList": rowsData})
+}
+
+// Handle /content path.
+func ContentHandler(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	content, err := ioutil.ReadFile("data/sample_hello_world.md")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	cr := NewChromaRenderer("perldoc")
+	output := blackfriday.Run(content, blackfriday.WithRenderer(cr))
+	output2 := string(output)
+
+	var templates = template.Must(template.New("").Funcs(funcMap).ParseFiles("templates/_base.html", "templates/read_sample.html"))
+
+	// Execute templates
+	templates.ExecuteTemplate(w, "_base.html", output2)
 }
 
 // Handle /see-code path
@@ -119,7 +282,7 @@ func SeeCode(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 	niceSaSourceCode = strings.Replace(niceSaSourceCode, "</pre>", "</code></pre>", -1)
 
 	// Execute template
-	templates.ExecuteTemplate(w, "sample_imaginative_go.html", map[string]interface{}{"sourceCode": niceSourceCode, "standAloneSourceCode": niceSaSourceCode, "id": fns[0]})
+	//templates.ExecuteTemplate(w, "sample_imaginative_go.html", map[string]interface{}{"sourceCode": niceSourceCode, "standAloneSourceCode": niceSaSourceCode, "id": fns[0]})
 }
 
 // Handle /hello-world path
@@ -216,13 +379,13 @@ func mysqlSelectMultipleRows(w http.ResponseWriter, r *http.Request, _ httproute
 }
 
 func mongodbSelectRows(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	var templates = template.Must(template.ParseFiles("mongodb_select_rows.html"))
+	//var templates = template.Must(template.ParseFiles("mongodb_select_rows.html"))
 
 	// client, _ := mongo.Connect(context.Background(), "mongodb://localhost:27017", nil)
 	// db := client.Database("go_db")
 	// collection := db.Collection("content_category")
 
-	client, err := mongo.NewClient("mongodb://@localhost:27017")
+	client, err := mongo.NewClient("mongodb://root:mongodbpassword@mongodb:27017")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -240,7 +403,7 @@ func mongodbSelectRows(w http.ResponseWriter, r *http.Request, _ httprouter.Para
 
 	//collection.InsertOne(nil, map[string]string{"name": "C", "slug": "c", "short_description": "Resource for learning C language"})
 
-	templates.ExecuteTemplate(w, "mongodb_select_rows.html", nil)
+	//templates.ExecuteTemplate(w, "mongodb_select_rows.html", nil)
 }
 
 func getQueryHandler(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
@@ -322,23 +485,24 @@ var funcMap = template.FuncMap{
 }
 
 // Prepare all templates
-var templates = template.Must(template.New("").Funcs(funcMap).ParseGlob("templates/editorial/*.html"))
+//var templates = template.Must(template.New("").Funcs(funcMap).ParseGlob("templates/*.html"))
 
 func main() {
 	mux := httprouter.New()
 
 	// Serve static files
 	mux.ServeFiles("/assets/*filepath", http.Dir("assets/"))
-	mux.ServeFiles("/assets-phantom/*filepath", http.Dir("templates/phantom/assets/"))
-	mux.ServeFiles("/images-phantom/*filepath", http.Dir("templates/phantom/images/"))
-	mux.ServeFiles("/assets-editorial/*filepath", http.Dir("templates/editorial/assets/"))
-	mux.ServeFiles("/images-editorial/*filepath", http.Dir("templates/editorial/images/"))
+	//mux.ServeFiles("/assets-phantom/*filepath", http.Dir("templates/phantom/assets/"))
+	//mux.ServeFiles("/images-phantom/*filepath", http.Dir("templates/phantom/images/"))
+	//mux.ServeFiles("/assets-editorial/*filepath", http.Dir("templates/editorial/assets/"))
+	//mux.ServeFiles("/images-editorial/*filepath", http.Dir("templates/editorial/images/"))
 
 	// Registers the handler function for the given pattern
-	mux.GET("/", DefaultHome)
-	mux.GET("/see-code", SeeCode)
-	mux.GET("/hello-world", SampleHelloWorld)
-	mux.GET("/hello-world-2", SampleHelloWorld2)
+	mux.GET("/", HomeHandler)
+	mux.GET("/content", ContentHandler)
+	mux.GET("/see-code/:slug", SeeCode)
+	mux.GET("/result/hello-world", SampleHelloWorld)
+	mux.GET("/result/hello-world-2", SampleHelloWorld2)
 	mux.GET("/display-imaginative-go-source", displayImaginativeGoSource)
 	mux.GET("/mysql-select-multiple-rows", mysqlSelectMultipleRows)
 	mux.GET("/mongo-select-rows", mongodbSelectRows)
